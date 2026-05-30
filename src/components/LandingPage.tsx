@@ -4,9 +4,10 @@ import { Plus, LogIn, MessageSquare, Shield, Zap } from 'lucide-react';
 interface LandingPageProps {
   onCreateRoom: (name: string) => void;
   onJoinRoom: (roomId: string, name: string) => void;
+  joinError?: string | null;
 }
 
-export const LandingPage: React.FC<LandingPageProps> = ({ onCreateRoom, onJoinRoom }) => {
+export const LandingPage: React.FC<LandingPageProps> = ({ onCreateRoom, onJoinRoom, joinError }) => {
   const [name, setName] = useState(() => localStorage.getItem('chat_player_name') || '');
   const [detectedRoomId] = useState<string | null>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -49,6 +50,16 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onCreateRoom, onJoinRo
         </div>
 
         <div className="bg-white dark:bg-zinc-900 p-8 rounded-3xl shadow-xl border border-zinc-200 dark:border-zinc-800 space-y-6">
+          {joinError === 'nickname_taken' && (
+            <div className="bg-red-50 dark:bg-red-950/20 border border-red-200 dark:border-red-900/50 p-4 rounded-2xl flex items-start gap-3">
+              <span className="text-red-500 font-bold shrink-0">⚠️</span>
+              <div className="text-left">
+                <p className="text-sm font-bold text-red-800 dark:text-red-400">加入失敗：暱稱已被佔用</p>
+                <p className="text-xs text-red-600 dark:text-red-500 mt-1 leading-normal">房間內已經有其他玩家使用此暱稱。請換一個名字再試一次！</p>
+              </div>
+            </div>
+          )}
+
           <div className="space-y-2">
             <label className="text-sm font-bold text-zinc-700 dark:text-zinc-300 ml-1">您的暱稱</label>
             <input

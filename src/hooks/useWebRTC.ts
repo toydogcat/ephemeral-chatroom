@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import mqtt from 'mqtt';
 import type { Player, ChatMessage, RoomState, SignalingMessage, SignalingData } from '../types';
 
@@ -22,12 +22,24 @@ export function useWebRTC() {
   const [isConnected, setIsConnected] = useState(false);
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [joinError, setJoinError] = useState<string | null>(null);
 
   const mqttClient = useRef<mqtt.MqttClient | null>(null);
   const peerConnections = useRef<{ [key: string]: RTCPeerConnection }>({});
   const dataChannels = useRef<{ [key: string]: RTCDataChannel }>({});
   const roomIdRef = useRef<string | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  
+  // 新增 playersRef 以免在 MQTT callback 中產生 stale state 閉包，完美解決檢查重名與重連邏輯
+  const playersRef = useRef<Player[]>([]);
+
+  useEffect(() => {
+    if (roomState) {
+      playersRef.current = roomState.players;
+    } else {
+      playersRef.current = [];
+    }
+  }, [roomState]);
 
   const broadcastMessage = useCallback((msg: ChatMessage) => {
     const data = JSON.stringify({ type: 'chat', ...msg });
@@ -39,6 +51,35 @@ export function useWebRTC() {
     setMessages((prev) => [...prev, msg]);
   }, []);
 
+  const disableVoice = useCallback(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+    setIsVoiceActive(false);
+    setRemoteStream(null);
+
+    // 自所有 RTCPeerConnection 中移除音軌，並重新協商
+    Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
+      pc.getSenders().forEach((sender) => {
+        if (sender.track && sender.track.kind === 'audio') {
+          pc.removeTrack(sender);
+        }
+      });
+
+      pc.createOffer().then((offer) => {
+        pc.setLocalDescription(offer);
+        const roomId = roomIdRef.current;
+        mqttClient.current?.publish(`luna/chat/${roomId}/signal/${peerId}`, JSON.stringify({
+          type: 'signal',
+          from: myId,
+          to: peerId,
+          data: { sdp: offer },
+        }));
+      });
+    });
+  }, [myId]);
+
   const setupDataChannel = useCallback((dc: RTCDataChannel, peerId: string) => {
     dataChannels.current[peerId] = dc;
     dc.onopen = () => {
@@ -46,22 +87,53 @@ export function useWebRTC() {
       setIsConnected(true);
     };
     dc.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.type === 'chat') {
-        setMessages((prev) => [...prev, msg]);
+      const data = JSON.parse(event.data);
+      
+      // 處理房主管理控制指令
+      if (data.type === 'control') {
+        if (data.action === 'mute' && data.targetId === myId) {
+          disableVoice();
+          alert('您已被房主禁言！麥克風已被強制關閉。');
+        }
+        return;
+      }
+
+      if (data.type === 'chat') {
+        setMessages((prev) => [...prev, data]);
       }
     };
     dc.onclose = () => {
       console.log(`Data channel with ${peerId} closed`);
       delete dataChannels.current[peerId];
     };
-  }, []);
+  }, [myId, disableVoice]);
 
   const handleGuestJoin = useCallback((roomId: string, guestId: string, guestName: string) => {
+    const currentPlayers = playersRef.current;
+
+    // 1. 審查暱稱唯一性 (不同 ID 但同名者拒絕)
+    const isNameTaken = currentPlayers.some(
+      (p) => p.id !== guestId && p.name.toLowerCase() === guestName.toLowerCase()
+    );
+    if (isNameTaken) {
+      console.log(`Join rejected: Nickname "${guestName}" is already taken.`);
+      mqttClient.current?.publish(
+        `luna/chat/${roomId}/join_reject/${guestId}`,
+        JSON.stringify({
+          type: 'join_reject',
+          reason: 'nickname_taken',
+        })
+      );
+      return; // 拒絕加入，不為其建立 WebRTC 連線
+    }
+
+    // 2. 檢查是否為「同 ID 重連」
+    const existingPlayer = currentPlayers.find((p) => p.id === guestId);
+
+    // 為新 Guest (或重連 Guest) 建立 RTCPeerConnection
     const pc = new RTCPeerConnection(ICE_SERVERS);
     peerConnections.current[guestId] = pc;
 
-    // 監聽對方的音軌
     pc.ontrack = (event) => {
       console.log('Host received remote track', event.streams[0]);
       if (event.streams && event.streams[0]) {
@@ -69,7 +141,6 @@ export function useWebRTC() {
       }
     };
 
-    // 如果目前自己已經開啟語音，則把自己的音軌加入
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => {
         pc.addTrack(track, localStreamRef.current!);
@@ -100,9 +171,19 @@ export function useWebRTC() {
       }));
     });
 
+    // 更新玩家列表
     setRoomState((prev) => {
       if (!prev) return null;
-      const newPlayers = [...prev.players, { id: guestId, name: guestName, isHost: false }];
+      
+      let newPlayers;
+      if (existingPlayer) {
+        // 同 ID 斷線重連：直接「取代」更新原有的 Player (徹底防止重連一堆重複暱稱)
+        newPlayers = prev.players.map((p) => (p.id === guestId ? { ...p, name: guestName } : p));
+      } else {
+        // 全新玩家加入
+        newPlayers = [...prev.players, { id: guestId, name: guestName, isHost: false }];
+      }
+
       mqttClient.current?.publish(`luna/chat/${roomId}/lobby_sync`, JSON.stringify({
         type: 'lobby_sync',
         players: newPlayers,
@@ -117,7 +198,6 @@ export function useWebRTC() {
       pc = new RTCPeerConnection(ICE_SERVERS);
       peerConnections.current[fromId] = pc;
 
-      // 監聽對方的音軌
       pc.ontrack = (event) => {
         console.log('Guest received remote track', event.streams[0]);
         if (event.streams && event.streams[0]) {
@@ -125,7 +205,6 @@ export function useWebRTC() {
         }
       };
 
-      // 如果目前自己已經開啟語音，則把自己的音軌加入
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => {
           pc.addTrack(track, localStreamRef.current!);
@@ -174,6 +253,7 @@ export function useWebRTC() {
   const createRoom = useCallback((name: string) => {
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
     roomIdRef.current = roomId;
+    setJoinError(null);
     const host: Player = { id: myId, name, isHost: true };
     
     setRoomState({
@@ -204,12 +284,14 @@ export function useWebRTC() {
 
   const joinRoom = useCallback((roomId: string, name: string) => {
     roomIdRef.current = roomId;
+    setJoinError(null);
     const client = mqtt.connect(MQTT_BROKER);
     mqttClient.current = client;
 
     client.on('connect', () => {
       client.subscribe(`luna/chat/${roomId}/lobby_sync`);
       client.subscribe(`luna/chat/${roomId}/signal/${myId}`);
+      client.subscribe(`luna/chat/${roomId}/join_reject/${myId}`); // 訂閱針對自己的拒絕信令
       
       client.publish(`luna/chat/${roomId}/join`, JSON.stringify({
         type: 'join',
@@ -221,7 +303,13 @@ export function useWebRTC() {
     client.on('message', (topic, payload) => {
       const msg: SignalingMessage = JSON.parse(payload.toString());
 
-      if (topic === `luna/chat/${roomId}/lobby_sync` && msg.type === 'lobby_sync') {
+      if (topic === `luna/chat/${roomId}/join_reject/${myId}` && msg.type === 'join_reject') {
+        console.log('Join rejected by host:', msg.reason);
+        setJoinError(msg.reason);
+        client.end();
+        mqttClient.current = null;
+        setRoomState(null);
+      } else if (topic === `luna/chat/${roomId}/lobby_sync` && msg.type === 'lobby_sync') {
         setRoomState({ roomId, players: msg.players, messages: [] });
       } else if (topic === `luna/chat/${roomId}/signal/${myId}` && msg.type === 'signal') {
         handleSignal(msg.from, msg.data);
@@ -264,41 +352,13 @@ export function useWebRTC() {
 
   const toggleVoice = useCallback(async () => {
     if (isVoiceActive) {
-      // 關閉語音
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => track.stop());
-        localStreamRef.current = null;
-      }
-      setIsVoiceActive(false);
-
-      // 自所有 RTCPeerConnection 中移除音軌，並重新協商
-      Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
-        pc.getSenders().forEach((sender) => {
-          if (sender.track && sender.track.kind === 'audio') {
-            pc.removeTrack(sender);
-          }
-        });
-
-        pc.createOffer().then((offer) => {
-          pc.setLocalDescription(offer);
-          const roomId = roomIdRef.current;
-          mqttClient.current?.publish(`luna/chat/${roomId}/signal/${peerId}`, JSON.stringify({
-            type: 'signal',
-            from: myId,
-            to: peerId,
-            data: { sdp: offer },
-          }));
-        });
-      });
-      setRemoteStream(null);
+      disableVoice();
     } else {
       try {
-        // 開啟語音
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         localStreamRef.current = stream;
         setIsVoiceActive(true);
 
-        // 將音軌加進所有 RTCPeerConnection 中，並重新協商
         Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
           stream.getTracks().forEach((track) => {
             pc.addTrack(track, stream);
@@ -320,7 +380,24 @@ export function useWebRTC() {
         alert('無法取得麥克風權限！請確認已授權。');
       }
     }
-  }, [isVoiceActive, myId]);
+  }, [isVoiceActive, disableVoice, myId]);
+
+  const muteGuest = useCallback((targetId: string) => {
+    const myPlayer = roomState?.players.find(p => p.id === myId);
+    if (!myPlayer?.isHost) return; // 只有 Host 才能控制禁言
+
+    const data = JSON.stringify({
+      type: 'control',
+      action: 'mute',
+      targetId,
+    });
+
+    Object.values(dataChannels.current).forEach((dc) => {
+      if (dc.readyState === 'open') {
+        dc.send(data);
+      }
+    });
+  }, [myId, roomState]);
 
   return {
     myId,
@@ -334,5 +411,7 @@ export function useWebRTC() {
     isVoiceActive,
     remoteStream,
     toggleVoice,
+    muteGuest,
+    joinError,
   };
 }

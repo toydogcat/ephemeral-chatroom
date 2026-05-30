@@ -15,12 +15,14 @@ function App() {
     isVoiceActive,
     remoteStream,
     toggleVoice,
+    muteGuest,
+    joinError,
   } = useWebRTC();
 
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
       {!roomState ? (
-        <LandingPage onCreateRoom={createRoom} onJoinRoom={joinRoom} />
+        <LandingPage onCreateRoom={createRoom} onJoinRoom={joinRoom} joinError={joinError} />
       ) : (
         <ChatRoom
           myId={myId}
@@ -33,6 +35,7 @@ function App() {
           isVoiceActive={isVoiceActive}
           remoteStream={remoteStream}
           onToggleVoice={toggleVoice}
+          onMuteGuest={muteGuest}
         />
       )}
     </div>

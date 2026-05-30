@@ -31,6 +31,7 @@ export interface SignalingData {
 
 export type SignalingMessage =
   | { type: 'join'; id: string; name: string }
+  | { type: 'join_reject'; reason: 'nickname_taken' }
   | { type: 'lobby_sync'; players: Player[] }
   | { type: 'signal'; from: string; to: string; data: SignalingData }
   | { type: 'start' };

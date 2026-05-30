@@ -26,6 +26,7 @@ interface ChatRoomProps {
   isVoiceActive?: boolean;
   remoteStream?: MediaStream | null;
   onToggleVoice?: () => void;
+  onMuteGuest?: (targetId: string) => void;
 }
 
 export const ChatRoom: React.FC<ChatRoomProps> = ({
@@ -39,6 +40,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   isVoiceActive = false,
   remoteStream = null,
   onToggleVoice,
+  onMuteGuest,
 }) => {
   const [inputText, setInputText] = useState('');
   const [showQRCode, setShowQRCode] = useState(false);
@@ -313,16 +315,35 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
       {/* Players List Mini */}
       <div className="px-4 py-2 bg-zinc-100 dark:bg-zinc-900/60 border-t border-zinc-200 dark:border-zinc-850 flex gap-2 overflow-x-auto no-scrollbar shrink-0">
-        {players.map((p) => (
-          <div
-            key={p.id}
-            className="flex items-center gap-1 px-2.5 py-1 bg-white dark:bg-zinc-800 rounded-full border border-zinc-200 dark:border-zinc-700 whitespace-nowrap text-xs shrink-0 font-medium shadow-sm"
-          >
-            {p.isHost && <Shield size={12} className="text-blue-500 shrink-0" />}
-            <span>{p.name}</span>
-            {p.id === myId && <span className="text-zinc-400 font-normal ml-0.5">(我)</span>}
-          </div>
-        ))}
+        {(() => {
+          const isMeHost = players.find((p) => p.id === myId)?.isHost || false;
+          return players.map((p) => (
+            <div
+              key={p.id}
+              className="flex items-center gap-1 px-2.5 py-1 bg-white dark:bg-zinc-800 rounded-full border border-zinc-200 dark:border-zinc-700 whitespace-nowrap text-xs shrink-0 font-medium shadow-sm"
+            >
+              {p.isHost && <Shield size={12} className="text-blue-500 shrink-0" />}
+              <span>{p.name}</span>
+              {p.id === myId && <span className="text-zinc-400 font-normal ml-0.5">(我)</span>}
+
+              {/* 房主專屬禁言按鈕 */}
+              {isMeHost && p.id !== myId && !p.isHost && onMuteGuest && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (confirm(`確定要將玩家「${p.name}」靜音嗎？`)) {
+                      onMuteGuest(p.id);
+                    }
+                  }}
+                  className="ml-1 p-0.5 hover:bg-red-50 dark:hover:bg-red-950/40 text-red-500 hover:text-red-600 rounded transition-colors shrink-0 cursor-pointer"
+                  title="強制禁言"
+                >
+                  <MicOff size={11} />
+                </button>
+              )}
+            </div>
+          ));
+        })()}
       </div>
 
       {/* Input Area */}
