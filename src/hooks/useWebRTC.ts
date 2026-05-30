@@ -47,6 +47,12 @@ export function useWebRTC() {
   // 解決 WebRTC 跨網絡連線 Timing 問題的暫存隊列
   const pendingCandidates = useRef<{ [key: string]: RTCIceCandidateInit[] }>({});
   const playersRef = useRef<Player[]>([]);
+  const presentationRef = useRef<any>(null);
+  const drawingHistoryRef = useRef<DrawingData[]>([]);
+
+  useEffect(() => {
+    presentationRef.current = presentation;
+  }, [presentation]);
 
   useEffect(() => {
     if (roomState) {
@@ -99,6 +105,35 @@ export function useWebRTC() {
     dc.onopen = () => {
       console.log(`Data channel with ${peerId} opened`);
       setIsConnected(true);
+
+      // 當我是房主（老師）時，將最新的教學狀態（教材與手寫筆跡歷史、PPT 播放資訊）秒級自動同步給新加入的房客（學生）！
+      const myPlayer = playersRef.current.find((p) => p.id === myId);
+      if (myPlayer?.isHost) {
+        // 1. 同步當前大屏幕上放映的教材（PDF/PPT/圖片等）
+        if (presentationRef.current) {
+          dc.send(JSON.stringify({
+            type: 'presentation',
+            contentType: presentationRef.current.contentType,
+            contentData: presentationRef.current.contentData,
+            name: presentationRef.current.name,
+          }));
+        }
+
+        // 2. 同步手寫白板板書歷史與 PPT 聯動翻頁頁碼狀態
+        if (drawingHistoryRef.current.length > 0) {
+          // 延遲 150 毫秒發送，給予房客端大屏幕 DOM 與 Iframe 渲染的黃金緩衝時間
+          setTimeout(() => {
+            if (dc.readyState === 'open') {
+              drawingHistoryRef.current.forEach((drawingMsg) => {
+                dc.send(JSON.stringify({
+                  type: 'drawing',
+                  ...drawingMsg
+                }));
+              });
+            }
+          }, 150);
+        }
+      }
     };
     dc.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -470,6 +505,9 @@ export function useWebRTC() {
     const myPlayer = roomState?.players.find((p) => p.id === myId);
     if (!myPlayer?.isHost) return;
 
+    // 更換新教材時，自動清空舊教材上的手寫筆跡與 PPT 頁碼歷史紀錄
+    drawingHistoryRef.current = [];
+
     const data = JSON.stringify({
       type: 'presentation',
       contentType,
@@ -490,6 +528,9 @@ export function useWebRTC() {
     const myPlayer = roomState?.players.find((p) => p.id === myId);
     if (!myPlayer?.isHost) return;
 
+    // 清空教材時，一併清空所有板書歷史紀錄
+    drawingHistoryRef.current = [];
+
     const data = JSON.stringify({
       type: 'clear_presentation',
     });
@@ -507,6 +548,26 @@ export function useWebRTC() {
   const broadcastDrawing = useCallback((drawingMsg: DrawingData) => {
     const myPlayer = roomState?.players.find((p) => p.id === myId);
     if (!myPlayer?.isHost) return;
+
+    // 智慧維護手寫與簡報同步歷史，以便新同學/斷線重連者能 100% 還原當前教學畫面
+    if (drawingMsg.action === 'clear') {
+      drawingHistoryRef.current = [];
+    } else if (drawingMsg.action === 'ppt_start') {
+      // 開啟新簡報，過濾掉以前所有簡報播放與翻頁信令，避免狀態混亂
+      drawingHistoryRef.current = drawingHistoryRef.current.filter(
+        (msg) => msg.action !== 'ppt_slide' && msg.action !== 'ppt_start'
+      );
+      drawingHistoryRef.current.push(drawingMsg);
+    } else if (drawingMsg.action === 'ppt_slide') {
+      // 翻頁時，過濾掉舊的翻頁信令，只保留最新的一頁，避免學生端 iframe 瘋狂跳轉
+      drawingHistoryRef.current = drawingHistoryRef.current.filter(
+        (msg) => msg.action !== 'ppt_slide'
+      );
+      drawingHistoryRef.current.push(drawingMsg);
+    } else {
+      // 普通繪圖畫線軌跡
+      drawingHistoryRef.current.push(drawingMsg);
+    }
 
     const data = JSON.stringify({
       type: 'drawing',
