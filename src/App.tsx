@@ -17,6 +17,9 @@ function App() {
     toggleVoice,
     muteGuest,
     joinError,
+    presentation,
+    broadcastPresentation,
+    clearPresentation,
   } = useWebRTC();
 
   return (
@@ -36,6 +39,9 @@ function App() {
           remoteStream={remoteStream}
           onToggleVoice={toggleVoice}
           onMuteGuest={muteGuest}
+          presentation={presentation}
+          onBroadcastPresentation={broadcastPresentation}
+          onClearPresentation={clearPresentation}
         />
       )}
     </div>

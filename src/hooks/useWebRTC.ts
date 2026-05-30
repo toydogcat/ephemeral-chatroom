@@ -24,13 +24,20 @@ export function useWebRTC() {
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [joinError, setJoinError] = useState<string | null>(null);
 
+  // 課堂大屏幕狀態 (同步展示教材或公告)
+  const [presentation, setPresentation] = useState<{
+    contentType: string;
+    contentData: string;
+    name?: string;
+  } | null>(null);
+
   const mqttClient = useRef<mqtt.MqttClient | null>(null);
   const peerConnections = useRef<{ [key: string]: RTCPeerConnection }>({});
   const dataChannels = useRef<{ [key: string]: RTCDataChannel }>({});
   const roomIdRef = useRef<string | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   
-  // 新增 playersRef 以免在 MQTT callback 中產生 stale state 閉包，完美解決檢查重名與重連邏輯
+  // playersRef 同步，完美避免閉包 Bug
   const playersRef = useRef<Player[]>([]);
 
   useEffect(() => {
@@ -59,7 +66,6 @@ export function useWebRTC() {
     setIsVoiceActive(false);
     setRemoteStream(null);
 
-    // 自所有 RTCPeerConnection 中移除音軌，並重新協商
     Object.entries(peerConnections.current).forEach(([peerId, pc]) => {
       pc.getSenders().forEach((sender) => {
         if (sender.track && sender.track.kind === 'audio') {
@@ -89,7 +95,7 @@ export function useWebRTC() {
     dc.onmessage = (event) => {
       const data = JSON.parse(event.data);
       
-      // 處理房主管理控制指令
+      // 1. 處理房主禁言指令
       if (data.type === 'control') {
         if (data.action === 'mute' && data.targetId === myId) {
           disableVoice();
@@ -98,7 +104,23 @@ export function useWebRTC() {
         return;
       }
 
-      if (data.type === 'chat') {
+      // 2. 處理課堂電子白板同步指令
+      if (data.type === 'presentation') {
+        setPresentation({
+          contentType: data.contentType,
+          contentData: data.contentData,
+          name: data.name,
+        });
+        return;
+      }
+
+      if (data.type === 'clear_presentation') {
+        setPresentation(null);
+        return;
+      }
+
+      // 3. 聊天訊息接收 (修復 data.type 被 msg.type 的 'text' 或 'file' 覆蓋導致 ignored 的 Bug)
+      if (data.senderId) {
         setMessages((prev) => [...prev, data]);
       }
     };
@@ -124,13 +146,12 @@ export function useWebRTC() {
           reason: 'nickname_taken',
         })
       );
-      return; // 拒絕加入，不為其建立 WebRTC 連線
+      return;
     }
 
     // 2. 檢查是否為「同 ID 重連」
     const existingPlayer = currentPlayers.find((p) => p.id === guestId);
 
-    // 為新 Guest (或重連 Guest) 建立 RTCPeerConnection
     const pc = new RTCPeerConnection(ICE_SERVERS);
     peerConnections.current[guestId] = pc;
 
@@ -171,16 +192,27 @@ export function useWebRTC() {
       }));
     });
 
-    // 更新玩家列表
+    // 如果老師當前有大白板內容，在新同學進來時，延遲一下將當前的 presentation 發送給他
+    if (presentation) {
+      setTimeout(() => {
+        if (dc.readyState === 'open') {
+          dc.send(JSON.stringify({
+            type: 'presentation',
+            contentType: presentation.contentType,
+            contentData: presentation.contentData,
+            name: presentation.name,
+          }));
+        }
+      }, 2000);
+    }
+
     setRoomState((prev) => {
       if (!prev) return null;
       
       let newPlayers;
       if (existingPlayer) {
-        // 同 ID 斷線重連：直接「取代」更新原有的 Player (徹底防止重連一堆重複暱稱)
         newPlayers = prev.players.map((p) => (p.id === guestId ? { ...p, name: guestName } : p));
       } else {
-        // 全新玩家加入
         newPlayers = [...prev.players, { id: guestId, name: guestName, isHost: false }];
       }
 
@@ -190,7 +222,7 @@ export function useWebRTC() {
       }));
       return { ...prev, players: newPlayers };
     });
-  }, [myId, setupDataChannel]);
+  }, [myId, setupDataChannel, presentation]);
 
   const handleSignal = useCallback(async (fromId: string, data: SignalingData) => {
     let pc = peerConnections.current[fromId];
@@ -291,7 +323,7 @@ export function useWebRTC() {
     client.on('connect', () => {
       client.subscribe(`luna/chat/${roomId}/lobby_sync`);
       client.subscribe(`luna/chat/${roomId}/signal/${myId}`);
-      client.subscribe(`luna/chat/${roomId}/join_reject/${myId}`); // 訂閱針對自己的拒絕信令
+      client.subscribe(`luna/chat/${roomId}/join_reject/${myId}`);
       
       client.publish(`luna/chat/${roomId}/join`, JSON.stringify({
         type: 'join',
@@ -384,7 +416,7 @@ export function useWebRTC() {
 
   const muteGuest = useCallback((targetId: string) => {
     const myPlayer = roomState?.players.find(p => p.id === myId);
-    if (!myPlayer?.isHost) return; // 只有 Host 才能控制禁言
+    if (!myPlayer?.isHost) return;
 
     const data = JSON.stringify({
       type: 'control',
@@ -397,6 +429,45 @@ export function useWebRTC() {
         dc.send(data);
       }
     });
+  }, [myId, roomState]);
+
+  // 老師端廣播大螢幕白板內容 (P2P 教學模式)
+  const broadcastPresentation = useCallback((contentType: string, contentData: string, name?: string) => {
+    const myPlayer = roomState?.players.find((p) => p.id === myId);
+    if (!myPlayer?.isHost) return;
+
+    const data = JSON.stringify({
+      type: 'presentation',
+      contentType,
+      contentData,
+      name,
+    });
+
+    Object.values(dataChannels.current).forEach((dc) => {
+      if (dc.readyState === 'open') {
+        dc.send(data);
+      }
+    });
+
+    setPresentation({ contentType, contentData, name });
+  }, [myId, roomState]);
+
+  // 老師端清空全班大白板
+  const clearPresentation = useCallback(() => {
+    const myPlayer = roomState?.players.find((p) => p.id === myId);
+    if (!myPlayer?.isHost) return;
+
+    const data = JSON.stringify({
+      type: 'clear_presentation',
+    });
+
+    Object.values(dataChannels.current).forEach((dc) => {
+      if (dc.readyState === 'open') {
+        dc.send(data);
+      }
+    });
+
+    setPresentation(null);
   }, [myId, roomState]);
 
   return {
@@ -413,5 +484,9 @@ export function useWebRTC() {
     toggleVoice,
     muteGuest,
     joinError,
+    // 導出大螢幕與推播狀態與方法
+    presentation,
+    broadcastPresentation,
+    clearPresentation,
   };
 }
