@@ -89,27 +89,158 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
   const isMeHost = players.find((p) => p.id === myId)?.isHost || false;
 
+  // 記錄當前 PPT 播放的頁碼，保證學生切換分頁或新教材載入時 100% 完美保持同步
+  const currentPptSlideIndexRef = useRef<number>(0);
+
+  // 當教材改變時，重置 PPT 頁碼為 0
+  useEffect(() => {
+    currentPptSlideIndexRef.current = 0;
+  }, [presentation]);
+
+  // 老師端監聽 iframe 內部簡報翻頁動作，並透過 P2P 數據信令同步廣播給全班
+  useEffect(() => {
+    const handleIframeMessage = (event: MessageEvent) => {
+      const msg = event.data;
+      if (!msg || typeof msg !== 'object') return;
+
+      // 當老師端的 iframe PPT 發出 scroll (即翻頁) 指令時，且我是老師
+      if (msg.type === 'iframe_scroll' && isMeHost) {
+        const slideIndex = Math.round(msg.scrollY / 100);
+        currentPptSlideIndexRef.current = slideIndex;
+
+        // P2P 廣播給所有學生
+        if (onBroadcastDrawing) {
+          onBroadcastDrawing({
+            action: 'ppt_slide',
+            index: slideIndex
+          });
+        }
+      }
+    };
+
+    window.addEventListener('message', handleIframeMessage);
+    return () => window.removeEventListener('message', handleIframeMessage);
+  }, [isMeHost, onBroadcastDrawing]);
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  // 調整 Canvas 實際寬高為其 DOM 寬高 (自適應)
+  // 安全 PDF 預覽 Blob URL 狀態 (防禦 CORS / 沙盒 CSP 導致 iframe 全白)
+  const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
+
+  // 儲存所有的筆跡歷史紀錄，防範任何 resizing、Tab 切換、或重新渲染導致畫布被瀏覽器強制抹除
+  const drawingHistoryRef = useRef<DrawingData[]>([]);
+
+  // 重新繪製歷史中的所有手寫塗鴉軌跡
+  const redrawHistory = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const rect = canvas.getBoundingClientRect();
+    
+    drawingHistoryRef.current.forEach((item) => {
+      if (item.action === 'draw') {
+        const x0 = (item.x0 ?? 0) * rect.width;
+        const y0 = (item.y0 ?? 0) * rect.height;
+        const x1 = (item.x1 ?? 0) * rect.width;
+        const y1 = (item.y1 ?? 0) * rect.height;
+        const color = item.color ?? '#ef4444';
+        const width = item.width ?? 3;
+        
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+      }
+    });
+  }, []);
+
+  // 調整 Canvas 實際寬高為其 DOM 寬高 (自適應，並在寬高變更時自動重繪筆跡)
   const resizeCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     
+    // 防禦保護：若 DOM 尚未渲染完成 (寬高為 0)，不進行 resize 避免將筆跡抹除
+    if (rect.width === 0 || rect.height === 0) return;
+    
     if (canvas.width !== Math.floor(rect.width) || canvas.height !== Math.floor(rect.height)) {
       canvas.width = Math.floor(rect.width);
       canvas.height = Math.floor(rect.height);
+      
+      // 每次寬高真的改變後，因為瀏覽器會清空 Canvas，我們必須立即重繪歷史軌跡！
+      requestAnimationFrame(() => {
+        redrawHistory();
+      });
     }
-  }, []);
+  }, [redrawHistory]);
 
+  // 當 presentation 改變時，在本地將 Base64 轉換為同源 Blob URL 載入，解決 iframe CORS 全白問題
+  useEffect(() => {
+    // 當教材改變或被清空時，自動清空筆跡歷史紀錄，並清屏畫布
+    drawingHistoryRef.current = [];
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    if (presentation && presentation.contentType === 'application/pdf') {
+      try {
+        const base64Parts = presentation.contentData.split(',');
+        const mime = base64Parts[0].match(/:(.*?);/)?.[1] || 'application/pdf';
+        const base64Data = base64Parts[1] || base64Parts[0];
+        
+        const byteCharacters = atob(base64Data);
+        const sliceSize = 1024;
+        const byteArrays = [];
+
+        for (let offset = 0; offset < byteCharacters.length; offset += sliceSize) {
+          const slice = byteCharacters.slice(offset, offset + sliceSize);
+          const byteNumbers = new Array(slice.length);
+          for (let i = 0; i < slice.length; i++) {
+            byteNumbers[i] = slice.charCodeAt(i);
+          }
+          const byteArray = new Uint8Array(byteNumbers);
+          byteArrays.push(byteArray);
+        }
+
+        const blob = new Blob(byteArrays, { type: mime });
+        const url = URL.createObjectURL(blob);
+        setPdfBlobUrl(url);
+
+        return () => {
+          URL.revokeObjectURL(url);
+        };
+      } catch (err) {
+        console.error('Failed to create PDF blob URL:', err);
+        setPdfBlobUrl(presentation.contentData); // 退化到 Base64
+      }
+    } else {
+      setPdfBlobUrl(null);
+    }
+  }, [presentation]);
+
+  // 確保切換 Tab、新教材載入或啟用畫筆時，Canvas 都能得到完美的 resize 和重繪
   useEffect(() => {
     resizeCanvas();
+    // 增加延遲的 resize 確保 DOM 在 Tab 切換渲染完成後，寬高已正確撐開
+    const timer = setTimeout(resizeCanvas, 100);
+    
     window.addEventListener('resize', resizeCanvas);
-    return () => window.removeEventListener('resize', resizeCanvas);
-  }, [presentation, isDrawingActive, resizeCanvas]);
+    return () => {
+      window.removeEventListener('resize', resizeCanvas);
+      clearTimeout(timer);
+    };
+  }, [presentation, isDrawingActive, activeTab, pdfBlobUrl, resizeCanvas]);
 
   // 本地繪製軌跡純函數
   const drawSegment = useCallback((
@@ -177,20 +308,24 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // 在本地繪製
+    // 1. 在本地 Canvas 上直接繪製軌跡
     drawSegment(ctx, lastPosRef.current.x, lastPosRef.current.y, currentX, currentY, brushColor, brushWidth);
 
-    // 百分比座標廣播給學生
+    // 2. 將該軌跡以百分比座標形式寫入歷史紀錄中，保證 resizing 或重繪時不會消失
+    const drawingMsg: DrawingData = {
+      action: 'draw',
+      x0: lastPosRef.current.x / rect.width,
+      y0: lastPosRef.current.y / rect.height,
+      x1: currentX / rect.width,
+      y1: currentY / rect.height,
+      color: brushColor,
+      width: brushWidth
+    };
+    drawingHistoryRef.current.push(drawingMsg);
+
+    // 3. P2P 實時廣播給所有學生端
     if (onBroadcastDrawing) {
-      onBroadcastDrawing({
-        action: 'draw',
-        x0: lastPosRef.current.x / rect.width,
-        y0: lastPosRef.current.y / rect.height,
-        x1: currentX / rect.width,
-        y1: currentY / rect.height,
-        color: brushColor,
-        width: brushWidth
-      });
+      onBroadcastDrawing(drawingMsg);
     }
 
     lastPosRef.current = { x: currentX, y: currentY };
@@ -201,38 +336,74 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   };
 
   const clearWhiteboard = () => {
+    // 1. 清空本地畫筆歷史
+    drawingHistoryRef.current = [];
+    
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    
+    // 2. 清除 Canvas 顯示
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     
+    // 3. 廣播清除指令給全班
     if (onBroadcastDrawing) {
       onBroadcastDrawing({ action: 'clear' });
     }
   };
 
-  // 學生端接收廣播塗鴉軌跡
+  // 學生端接收與同步廣播塗鴉軌跡 (結合歷史緩存，解決高頻 P2P 重點消失問題)
   useEffect(() => {
     if (!drawingData) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
     
-    const rect = canvas.getBoundingClientRect();
-
-    if (drawingData.action === 'draw') {
-      const x0 = (drawingData.x0 ?? 0) * rect.width;
-      const y0 = (drawingData.y0 ?? 0) * rect.height;
-      const x1 = (drawingData.x1 ?? 0) * rect.width;
-      const y1 = (drawingData.y1 ?? 0) * rect.height;
-      const color = drawingData.color ?? '#ef4444';
-      const width = drawingData.width ?? 3;
+    if (drawingData.action === 'clear') {
+      drawingHistoryRef.current = [];
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    } else if (drawingData.action === 'draw') {
+      // 避免因為網絡重傳或 react 批次更新造成重複繪製歷史
+      const isDuplicate = drawingHistoryRef.current.some(
+        (item) => 
+          item.x0 === drawingData.x0 && 
+          item.y0 === drawingData.y0 && 
+          item.x1 === drawingData.x1 && 
+          item.y1 === drawingData.y1
+      );
       
-      drawSegment(ctx, x0, y0, x1, y1, color, width);
-    } else if (drawingData.action === 'clear') {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!isDuplicate) {
+        drawingHistoryRef.current.push(drawingData);
+        
+        const canvas = canvasRef.current;
+        if (canvas) {
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            const rect = canvas.getBoundingClientRect();
+            const x0 = (drawingData.x0 ?? 0) * rect.width;
+            const y0 = (drawingData.y0 ?? 0) * rect.height;
+            const x1 = (drawingData.x1 ?? 0) * rect.width;
+            const y1 = (drawingData.y1 ?? 0) * rect.height;
+            const color = drawingData.color ?? '#ef4444';
+            const width = drawingData.width ?? 3;
+            drawSegment(ctx, x0, y0, x1, y1, color, width);
+          }
+        }
+      }
+    } else if (drawingData.action === 'ppt_slide') {
+      const slideIndex = drawingData.index ?? 0;
+      currentPptSlideIndexRef.current = slideIndex;
+      
+      // 遙控本地 iframe 翻頁，達成老師到哪頁、學生就同步到哪頁的極致教學體驗！
+      const iframe = document.querySelector('iframe[title="Professional PPT Presentation"]') as HTMLIFrameElement;
+      if (iframe && iframe.contentWindow) {
+        iframe.contentWindow.postMessage({
+          action: 'go_to_slide',
+          index: slideIndex
+        }, '*');
+      }
     }
   }, [drawingData, drawSegment]);
 
@@ -471,8 +642,8 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               <span className="px-2.5 py-0.5 bg-indigo-950 text-indigo-400 rounded-full font-bold border border-indigo-900/40">教學模式</span>
             </div>
             <iframe
-              src={presentation.contentData}
-              className="flex-1 w-full rounded-2xl bg-zinc-900 border border-zinc-800 shadow-inner"
+              src={pdfBlobUrl || presentation.contentData}
+              className="flex-1 w-full rounded-2xl bg-zinc-950 border border-zinc-800 shadow-inner"
               title="PDF 教本閱讀"
             />
           </div>
@@ -496,6 +667,18 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               className="flex-1 w-full rounded-2xl bg-zinc-950 border border-zinc-800 shadow-inner animate-fade-in"
               title="Professional PPT Presentation"
               allow="fullscreen"
+              onLoad={(e) => {
+                const iframe = e.currentTarget;
+                if (iframe && iframe.contentWindow) {
+                  // 延遲 150 毫秒，確保 iframe 內部的 JS 與 DOM 已經完全初始化完畢
+                  setTimeout(() => {
+                    iframe.contentWindow?.postMessage({
+                      action: 'go_to_slide',
+                      index: currentPptSlideIndexRef.current
+                    }, '*');
+                  }, 150);
+                }
+              }}
             />
           </div>
         </div>
