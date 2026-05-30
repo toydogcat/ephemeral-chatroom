@@ -35,3 +35,14 @@ export type SignalingMessage =
   | { type: 'lobby_sync'; players: Player[] }
   | { type: 'signal'; from: string; to: string; data: SignalingData }
   | { type: 'start' };
+
+export interface DrawingData {
+  type?: 'drawing';
+  action: 'draw' | 'clear';
+  x0?: number;
+  y0?: number;
+  x1?: number;
+  y1?: number;
+  color?: string;
+  width?: number;
+}

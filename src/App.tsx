@@ -20,6 +20,8 @@ function App() {
     presentation,
     broadcastPresentation,
     clearPresentation,
+    drawingData,
+    broadcastDrawing,
   } = useWebRTC();
 
   return (
@@ -42,6 +44,8 @@ function App() {
           presentation={presentation}
           onBroadcastPresentation={broadcastPresentation}
           onClearPresentation={clearPresentation}
+          drawingData={drawingData}
+          onBroadcastDrawing={broadcastDrawing}
         />
       )}
     </div>

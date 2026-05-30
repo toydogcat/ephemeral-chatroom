@@ -52,6 +52,8 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   presentation = null,
   onBroadcastPresentation,
   onClearPresentation,
+  drawingData = null,
+  onBroadcastDrawing,
 }) => {
   const [inputText, setInputText] = useState('');
   const [showQRCode, setShowQRCode] = useState(false);
@@ -64,6 +66,18 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   // 老師教材廣播相關狀態
   const [announcementText, setAnnouncementText] = useState('');
   const [isBroadcastingFile, setIsBroadcastingFile] = useState(false);
+  const [showPptPanel, setShowPptPanel] = useState(false);
+  const [customPptUrl, setCustomPptUrl] = useState('https://toydogcat.github.io/ai-ppt-report/');
+
+  // 電子白板手寫互動狀態
+  const [isDrawingActive, setIsDrawingActive] = useState(false);
+  const [brushColor, setBrushColor] = useState('#ef4444'); // 默認紅色
+  const [brushWidth, setBrushWidth] = useState(3); // 默認 3px
+
+  // Canvas 繪圖 Ref
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const isDrawingRef = useRef(false);
+  const lastPosRef = useRef({ x: 0, y: 0 });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -75,6 +89,149 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
+
+  // 調整 Canvas 實際寬高為其 DOM 寬高 (自適應)
+  const resizeCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    
+    if (canvas.width !== Math.floor(rect.width) || canvas.height !== Math.floor(rect.height)) {
+      canvas.width = Math.floor(rect.width);
+      canvas.height = Math.floor(rect.height);
+    }
+  }, []);
+
+  useEffect(() => {
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+    return () => window.removeEventListener('resize', resizeCanvas);
+  }, [presentation, isDrawingActive, resizeCanvas]);
+
+  // 本地繪製軌跡純函數
+  const drawSegment = useCallback((
+    ctx: CanvasRenderingContext2D,
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+    color: string,
+    width: number
+  ) => {
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }, []);
+
+  // 老師（Host）開始繪圖
+  const startDrawing = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+    if (!isMeHost || !isDrawingActive) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    
+    let clientX, clientY;
+    if ('touches' in e) {
+      if (e.touches.length === 0) return;
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else {
+      clientX = e.clientX;
+      clientY = e.clientY;
+    }
+
+    isDrawingRef.current = true;
+    lastPosRef.current = {
+      x: clientX - rect.left,
+      y: clientY - rect.top,
+    };
+  };
+
+  // 老師（Host）滑動繪圖
+  const draw = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+    if (!isMeHost || !isDrawingActive || !isDrawingRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    
+    let clientX, clientY;
+    if ('touches' in e) {
+      if (e.touches.length === 0) return;
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else {
+      clientX = e.clientX;
+      clientY = e.clientY;
+    }
+
+    const currentX = clientX - rect.left;
+    const currentY = clientY - rect.top;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // 在本地繪製
+    drawSegment(ctx, lastPosRef.current.x, lastPosRef.current.y, currentX, currentY, brushColor, brushWidth);
+
+    // 百分比座標廣播給學生
+    if (onBroadcastDrawing) {
+      onBroadcastDrawing({
+        action: 'draw',
+        x0: lastPosRef.current.x / rect.width,
+        y0: lastPosRef.current.y / rect.height,
+        x1: currentX / rect.width,
+        y1: currentY / rect.height,
+        color: brushColor,
+        width: brushWidth
+      });
+    }
+
+    lastPosRef.current = { x: currentX, y: currentY };
+  };
+
+  const stopDrawing = () => {
+    isDrawingRef.current = false;
+  };
+
+  const clearWhiteboard = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    if (onBroadcastDrawing) {
+      onBroadcastDrawing({ action: 'clear' });
+    }
+  };
+
+  // 學生端接收廣播塗鴉軌跡
+  useEffect(() => {
+    if (!drawingData) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    const rect = canvas.getBoundingClientRect();
+
+    if (drawingData.action === 'draw') {
+      const x0 = (drawingData.x0 ?? 0) * rect.width;
+      const y0 = (drawingData.y0 ?? 0) * rect.height;
+      const x1 = (drawingData.x1 ?? 0) * rect.width;
+      const y1 = (drawingData.y1 ?? 0) * rect.height;
+      const color = drawingData.color ?? '#ef4444';
+      const width = drawingData.width ?? 3;
+      
+      drawSegment(ctx, x0, y0, x1, y1, color, width);
+    } else if (drawingData.action === 'clear') {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [drawingData, drawSegment]);
 
   useEffect(() => {
     scrollToBottom();
@@ -297,6 +454,47 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               <span className="truncate max-w-[200px]">老師分享的圖片：{presentation.name}</span>
             </div>
           )}
+        </div>
+      );
+    }
+
+    // 📄 PDF 直接內嵌大白板預覽 (重大升級)
+    if (type === 'application/pdf') {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center p-4 bg-zinc-950 text-zinc-100 animate-fade-in">
+          <div className="w-full h-full max-w-6xl bg-zinc-900 border border-zinc-800 rounded-3xl p-3 shadow-xl flex flex-col">
+            <div className="flex items-center justify-between text-[10px] text-zinc-400 px-1 pb-2 shrink-0 select-none">
+              <span className="font-bold text-zinc-350 truncate">📄 課堂 PDF 教本閱讀：{presentation.name}</span>
+              <span className="px-2.5 py-0.5 bg-indigo-950 text-indigo-400 rounded-full font-bold border border-indigo-900/40">教學模式</span>
+            </div>
+            <iframe
+              src={presentation.contentData}
+              className="flex-1 w-full rounded-2xl bg-zinc-900 border border-zinc-800 shadow-inner"
+              title="PDF 教本閱讀"
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // 🌐 專業 PPT 聯動展示 (重大生態整合)
+    if (type === 'ppt') {
+      return (
+        <div className="w-full h-full flex flex-col items-center justify-center p-4 bg-zinc-950 text-zinc-100 animate-fade-in relative">
+          <div className="w-full h-full max-w-7xl bg-zinc-900 border border-zinc-800 rounded-3xl p-3 shadow-2xl flex flex-col relative overflow-hidden">
+            <div className="flex items-center justify-between text-[10px] text-zinc-450 px-2 pb-2 shrink-0 select-none">
+              <span className="font-extrabold text-indigo-400 flex items-center gap-1.5 animate-pulse">
+                <Presentation size={13} /> Luna PPT Hub 聯動教學：{presentation.name || "專業簡報"}
+              </span>
+              <span className="px-2 py-0.5 bg-indigo-950 text-indigo-400 rounded-full font-bold border border-indigo-900/40">簡報放映中</span>
+            </div>
+            <iframe
+              src={presentation.contentData}
+              className="flex-1 w-full rounded-2xl bg-zinc-950 border border-zinc-800 shadow-inner animate-fade-in"
+              title="Professional PPT Presentation"
+              allow="fullscreen"
+            />
+          </div>
         </div>
       );
     }
@@ -633,23 +831,123 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           </div>
           
           <div className="hidden sm:flex items-center gap-4 text-[10px] font-semibold text-zinc-450">
+            {isMeHost && presentation && (
+              <button
+                type="button"
+                onClick={() => setIsDrawingActive(!isDrawingActive)}
+                className={`px-3 py-1 rounded-full text-[9px] font-black cursor-pointer transition-all border flex items-center gap-1 ${
+                  isDrawingActive
+                    ? 'bg-indigo-600 hover:bg-indigo-500 text-white border-indigo-500 shadow-md shadow-indigo-500/20'
+                    : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-350 border-zinc-700'
+                }`}
+                title="啟用手寫塗鴉白板"
+              >
+                <Edit2 size={11} />
+                <span>🎨 畫筆工具</span>
+              </button>
+            )}
+
             {presentation ? (
-              <span className="flex items-center gap-1 text-green-400 bg-green-950/40 border border-green-900/30 px-2 py-0.5 rounded-full">
-                <span className="w-1 h-1 rounded-full bg-green-500 animate-ping"></span>
+              <span className="flex items-center gap-1 text-green-400 bg-green-950/40 border border-green-900/30 px-2 py-0.5 rounded-full animate-fade-in">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-ping"></span>
                 老師廣播中
               </span>
             ) : (
               <span className="text-zinc-500 flex items-center gap-1">
-                <span className="w-1 h-1 rounded-full bg-zinc-650"></span>
+                <span className="w-1 h-1 rounded-full bg-zinc-655"></span>
                 靜置中
               </span>
             )}
           </div>
         </header>
 
-        {/* 主要展示大屏幕白板區 */}
-        <div className="flex-1 overflow-auto flex items-center justify-center relative">
+        {/* 主要展示大屏幕白板區 (覆蓋透明手寫畫布) */}
+        <div id="whiteboard-container" className="flex-1 overflow-hidden flex items-center justify-center relative bg-zinc-950 w-full h-full">
           {renderPresentationContent()}
+          
+          {/* 透明手寫 Canvas 繪圖層 */}
+          {presentation && (
+            <canvas
+              ref={canvasRef}
+              className={`absolute inset-0 w-full h-full z-20 ${
+                isDrawingActive ? 'cursor-crosshair pointer-events-auto' : 'pointer-events-none'
+              }`}
+              onMouseDown={startDrawing}
+              onMouseMove={draw}
+              onMouseUp={stopDrawing}
+              onMouseLeave={stopDrawing}
+              onTouchStart={startDrawing}
+              onTouchMove={draw}
+              onTouchEnd={stopDrawing}
+            />
+          )}
+
+          {/* 懸浮玻璃霧面畫筆顏色/粗細控制面板 (僅 Host 可見) */}
+          {isMeHost && isDrawingActive && presentation && (
+            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 px-3.5 py-2 bg-zinc-900/90 backdrop-blur-md border border-zinc-800 rounded-2xl flex items-center gap-4 shadow-2xl animate-fade-in select-none">
+              <div className="flex items-center gap-1.5 border-r border-zinc-800 pr-3.5">
+                <span className="text-[10px] font-black text-indigo-400">🎨 畫筆</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping"></span>
+              </div>
+              
+              {/* 五色切換 */}
+              <div className="flex items-center gap-1.5">
+                {[
+                  { hex: '#ef4444', label: '紅' },
+                  { hex: '#3b82f6', label: '藍' },
+                  { hex: '#22c55e', label: '綠' },
+                  { hex: '#eab308', label: '黃' },
+                  { hex: '#ffffff', label: '白' }
+                ].map((c) => (
+                  <button
+                    key={c.hex}
+                    type="button"
+                    onClick={() => setBrushColor(c.hex)}
+                    className={`w-4 h-4 rounded-full border cursor-pointer transition-all ${
+                      brushColor === c.hex ? 'scale-125 border-white ring-2 ring-indigo-550/50' : 'border-transparent hover:scale-110'
+                    }`}
+                    style={{ backgroundColor: c.hex }}
+                    title={c.label}
+                  />
+                ))}
+              </div>
+
+              {/* 粗細選擇 */}
+              <div className="flex items-center gap-1 bg-zinc-950 px-2 py-0.5 rounded-lg border border-zinc-800">
+                {[2, 5, 8].map((w) => (
+                  <button
+                    key={w}
+                    type="button"
+                    onClick={() => setBrushWidth(w)}
+                    className={`px-1.5 py-0.5 text-[8px] font-extrabold rounded cursor-pointer transition-all ${
+                      brushWidth === w ? 'bg-indigo-650 text-white shadow-sm' : 'text-zinc-550 hover:text-zinc-300'
+                    }`}
+                  >
+                    {w === 2 ? '細' : w === 5 ? '中' : '粗'}
+                  </button>
+                ))}
+              </div>
+
+              {/* 清除與關閉按鈕 */}
+              <button
+                type="button"
+                onClick={clearWhiteboard}
+                className="px-2.5 py-1 bg-zinc-800 hover:bg-red-950/60 border border-zinc-700 hover:border-red-900/60 text-zinc-400 hover:text-red-400 rounded-lg text-[9px] font-bold transition-all cursor-pointer flex items-center gap-1"
+                title="清空大屏幕筆跡"
+              >
+                <Trash2 size={11} />
+                <span>清屏</span>
+              </button>
+              
+              <button
+                type="button"
+                onClick={() => setIsDrawingActive(false)}
+                className="px-2 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-450 rounded-lg text-[9px] font-black cursor-pointer"
+              >
+                關閉
+              </button>
+            </div>
+          )}
         </div>
 
         {/* 老師教材廣播控制台 (僅 Host 可見，圓角浮動微卡片) */}
@@ -717,13 +1015,31 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                   <span>推播教材</span>
                 </button>
 
+                {/* 聯動 PPT 按鈕 */}
+                <button
+                  type="button"
+                  disabled={!isConnected}
+                  onClick={() => setShowPptPanel(!showPptPanel)}
+                  className={`px-3 py-1.5 rounded-full text-[10px] font-bold transition-all flex items-center gap-1 cursor-pointer ${
+                    !isConnected
+                      ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
+                      : showPptPanel
+                        ? 'bg-indigo-650 hover:bg-indigo-550 text-white border border-indigo-550 shadow-md shadow-indigo-600/10'
+                        : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700'
+                  }`}
+                  title="聯動專業 PPT 播放器展示課堂簡報"
+                >
+                  <Presentation size={12} />
+                  <span>聯動 PPT</span>
+                </button>
+
                 {/* 清屏按鈕 */}
                 {presentation && onClearPresentation && (
                   <button
                     type="button"
                     onClick={onClearPresentation}
                     className="px-3 py-1.5 bg-red-950/40 hover:bg-red-950 border border-red-900/50 hover:border-red-700 text-red-400 rounded-full text-[10px] font-bold transition-all flex items-center gap-1 cursor-pointer"
-                    title="清空學生端大白板"
+                    title="清空學生端大白板與筆跡"
                   >
                     <Trash2 size={12} />
                     <span>清空</span>
@@ -731,6 +1047,43 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                 )}
               </div>
             </div>
+
+            {/* 聯動 PPT 控制副面板 */}
+            {showPptPanel && (
+              <div className="mt-2 p-3 bg-zinc-950/90 backdrop-blur-md rounded-2xl border border-zinc-800/80 flex flex-col gap-2 animate-fade-in relative z-10">
+                <div className="flex items-center justify-between text-[10px] text-zinc-455 font-bold select-none">
+                  <span className="text-indigo-400 flex items-center gap-1">
+                    🌐 專業 PPT 聯動教學設定
+                  </span>
+                  <span>支援自訂 Luna PPT URL 網址</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={customPptUrl}
+                    onChange={(e) => setCustomPptUrl(e.target.value)}
+                    placeholder="貼上 Luna PPT Hub 簡報網址..."
+                    className="flex-1 bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1 text-[10px] text-zinc-250 focus:border-indigo-500 outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (onBroadcastPresentation && customPptUrl.trim()) {
+                        onBroadcastPresentation('ppt', customPptUrl.trim(), 'Luna AI PPT 專業簡報');
+                        setShowPptPanel(false);
+                      }
+                    }}
+                    disabled={!customPptUrl.trim() || !isConnected}
+                    className="px-3.5 py-1 bg-indigo-655 hover:bg-indigo-555 disabled:bg-zinc-800 disabled:text-zinc-550 text-white rounded-lg text-[10px] font-extrabold transition-all cursor-pointer shadow-md shadow-indigo-600/20 shrink-0"
+                  >
+                    推播簡報
+                  </button>
+                </div>
+                <div className="text-[9px] text-zinc-500 leading-relaxed pl-0.5 select-none font-medium font-sans">
+                  💡 聯動提示：推播後大屏幕會滿版載入該簡報。您可以開啟 <span className="text-indigo-400 font-bold">🎨 畫筆工具</span> 直接在放映中的簡報上書寫、標記重點，筆跡會實時同步全班！
+                </div>
+              </div>
+            )}
           </div>
         )}
       </section>

@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import mqtt from 'mqtt';
-import type { Player, ChatMessage, RoomState, SignalingMessage, SignalingData } from '../types';
+import type { Player, ChatMessage, RoomState, SignalingMessage, SignalingData, DrawingData } from '../types';
 
 const MQTT_BROKER = 'wss://broker.emqx.io:8084/mqtt';
 const ICE_SERVERS = {
@@ -35,13 +35,16 @@ export function useWebRTC() {
     name?: string;
   } | null>(null);
 
+  // 電子白板互動塗鴉狀態
+  const [drawingData, setDrawingData] = useState<DrawingData | null>(null);
+
   const mqttClient = useRef<mqtt.MqttClient | null>(null);
   const peerConnections = useRef<{ [key: string]: RTCPeerConnection }>({});
   const dataChannels = useRef<{ [key: string]: RTCDataChannel }>({});
   const roomIdRef = useRef<string | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   
-  // 解決 WebRTC 跨網絡 (如 Wi-Fi vs 5G 行動網絡) 連線 Timing 問題的暫存隊列
+  // 解決 WebRTC 跨網絡連線 Timing 問題的暫存隊列
   const pendingCandidates = useRef<{ [key: string]: RTCIceCandidateInit[] }>({});
   const playersRef = useRef<Player[]>([]);
 
@@ -124,7 +127,13 @@ export function useWebRTC() {
         return;
       }
 
-      // 3. 聊天訊息接收
+      // 3. 處理電子白板手寫塗鴉 P2P 同步指令
+      if (data.type === 'drawing') {
+        setDrawingData(data);
+        return;
+      }
+
+      // 4. 聊天訊息接收
       if (data.senderId) {
         setMessages((prev) => [...prev, data]);
       }
@@ -494,6 +503,23 @@ export function useWebRTC() {
     setPresentation(null);
   }, [myId, roomState]);
 
+  // 老師端廣播手寫塗鴉軌跡 (P2P 同步)
+  const broadcastDrawing = useCallback((drawingMsg: DrawingData) => {
+    const myPlayer = roomState?.players.find((p) => p.id === myId);
+    if (!myPlayer?.isHost) return;
+
+    const data = JSON.stringify({
+      type: 'drawing',
+      ...drawingMsg,
+    });
+
+    Object.values(dataChannels.current).forEach((dc) => {
+      if (dc.readyState === 'open') {
+        dc.send(data);
+      }
+    });
+  }, [myId, roomState]);
+
   return {
     myId,
     roomState,
@@ -511,5 +537,8 @@ export function useWebRTC() {
     presentation,
     broadcastPresentation,
     clearPresentation,
+    // 白板互動導出
+    drawingData,
+    broadcastDrawing,
   };
 }
