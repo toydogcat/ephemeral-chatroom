@@ -38,7 +38,7 @@ export type SignalingMessage =
 
 export interface DrawingData {
   type?: 'drawing';
-  action: 'draw' | 'clear' | 'ppt_slide';
+  action: 'draw' | 'clear' | 'ppt_slide' | 'ppt_start';
   x0?: number;
   y0?: number;
   x1?: number;
@@ -46,4 +46,5 @@ export interface DrawingData {
   color?: string;
   width?: number;
   index?: number;
+  deck?: any;
 }

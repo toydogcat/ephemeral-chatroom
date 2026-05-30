@@ -89,19 +89,35 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
   const isMeHost = players.find((p) => p.id === myId)?.isHost || false;
 
-  // 記錄當前 PPT 播放的頁碼，保證學生切換分頁或新教材載入時 100% 完美保持同步
+  // 記錄當前 PPT 播放的頁碼與簡報內容物件，保證學生切換分頁或新教材載入時 100% 完美保持同步
   const currentPptSlideIndexRef = useRef<number>(0);
+  const currentPptDeckRef = useRef<any>(null);
 
-  // 當教材改變時，重置 PPT 頁碼為 0
+  // 當教材改變時，重置 PPT 頁碼與簡報資料
   useEffect(() => {
     currentPptSlideIndexRef.current = 0;
+    currentPptDeckRef.current = null;
   }, [presentation]);
 
-  // 老師端監聽 iframe 內部簡報翻頁動作，並透過 P2P 數據信令同步廣播給全班
+  // 老師端監聽 iframe 內部簡報翻頁與播放動作，並透過 P2P 數據信令同步廣播給全班
   useEffect(() => {
     const handleIframeMessage = (event: MessageEvent) => {
       const msg = event.data;
       if (!msg || typeof msg !== 'object') return;
+
+      // 當老師端的 iframe PPT 啟動放映時，且我是老師
+      if (msg.type === 'iframe_presentation_start' && isMeHost) {
+        currentPptDeckRef.current = msg.deck;
+        currentPptSlideIndexRef.current = 0;
+
+        // P2P 廣播給所有學生
+        if (onBroadcastDrawing) {
+          onBroadcastDrawing({
+            action: 'ppt_start',
+            deck: msg.deck
+          });
+        }
+      }
 
       // 當老師端的 iframe PPT 發出 scroll (即翻頁) 指令時，且我是老師
       if (msg.type === 'iframe_scroll' && isMeHost) {
@@ -392,6 +408,20 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           }
         }
       }
+    } else if (drawingData.action === 'ppt_start') {
+      if (drawingData.deck) {
+        currentPptDeckRef.current = drawingData.deck;
+        currentPptSlideIndexRef.current = 0;
+        
+        // 遙控學生端本地 iframe 自動同步開啟與載入該簡報！
+        const iframe = document.querySelector('iframe[title="Professional PPT Presentation"]') as HTMLIFrameElement;
+        if (iframe && iframe.contentWindow) {
+          iframe.contentWindow.postMessage({
+            action: 'sync_start_presentation',
+            deck: drawingData.deck
+          }, '*');
+        }
+      }
     } else if (drawingData.action === 'ppt_slide') {
       const slideIndex = drawingData.index ?? 0;
       currentPptSlideIndexRef.current = slideIndex;
@@ -420,6 +450,14 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       setHasNewPresentation(true);
     }
   }
+
+  // 當老師推送新教材（PDF, PPT, 圖片）時，自動幫全體成員（包含老師與學生）將當前頁面切換至大屏幕，保證即時展現！
+  useEffect(() => {
+    if (presentation) {
+      setActiveTab('board');
+      setHasNewPresentation(false); // 既然自動切換了，就不需要再顯示紅點提示
+    }
+  }, [presentation]);
 
   useEffect(() => {
     if (remoteAudioRef.current && remoteStream) {
@@ -635,18 +673,16 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     // 📄 PDF 直接內嵌大白板預覽 (重大升級)
     if (type === 'application/pdf') {
       return (
-        <div className="w-full h-full flex flex-col items-center justify-center p-4 bg-zinc-950 text-zinc-100 animate-fade-in">
-          <div className="w-full h-full max-w-6xl bg-zinc-900 border border-zinc-800 rounded-3xl p-3 shadow-xl flex flex-col">
-            <div className="flex items-center justify-between text-[10px] text-zinc-400 px-1 pb-2 shrink-0 select-none">
-              <span className="font-bold text-zinc-350 truncate">📄 課堂 PDF 教本閱讀：{presentation.name}</span>
-              <span className="px-2.5 py-0.5 bg-indigo-950 text-indigo-400 rounded-full font-bold border border-indigo-900/40">教學模式</span>
-            </div>
-            <iframe
-              src={pdfBlobUrl || presentation.contentData}
-              className="flex-1 w-full rounded-2xl bg-zinc-950 border border-zinc-800 shadow-inner"
-              title="PDF 教本閱讀"
-            />
+        <div className="w-full h-full flex flex-col bg-zinc-950 text-zinc-100 animate-fade-in relative">
+          <div className="flex items-center justify-between text-[10px] text-zinc-400 px-4 py-2 bg-zinc-900 border-b border-zinc-800 shrink-0 select-none">
+            <span className="font-bold text-zinc-350 truncate">📄 課堂 PDF 教本閱讀：{presentation.name}</span>
+            <span className="px-2 py-0.5 bg-indigo-950 text-indigo-400 rounded-full font-bold border border-indigo-900/40">教學模式</span>
           </div>
+          <iframe
+            src={pdfBlobUrl || presentation.contentData}
+            className="flex-1 w-full bg-zinc-950 border-0 shadow-inner"
+            title="PDF 教本閱讀"
+          />
         </div>
       );
     }
@@ -654,33 +690,40 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     // 🌐 專業 PPT 聯動展示 (重大生態整合)
     if (type === 'ppt') {
       return (
-        <div className="w-full h-full flex flex-col items-center justify-center p-4 bg-zinc-950 text-zinc-100 animate-fade-in relative">
-          <div className="w-full h-full max-w-7xl bg-zinc-900 border border-zinc-800 rounded-3xl p-3 shadow-2xl flex flex-col relative overflow-hidden">
-            <div className="flex items-center justify-between text-[10px] text-zinc-450 px-2 pb-2 shrink-0 select-none">
-              <span className="font-extrabold text-indigo-400 flex items-center gap-1.5 animate-pulse">
-                <Presentation size={13} /> Luna PPT Hub 聯動教學：{presentation.name || "專業簡報"}
-              </span>
-              <span className="px-2 py-0.5 bg-indigo-950 text-indigo-400 rounded-full font-bold border border-indigo-900/40">簡報放映中</span>
-            </div>
-            <iframe
-              src={presentation.contentData}
-              className="flex-1 w-full rounded-2xl bg-zinc-950 border border-zinc-800 shadow-inner animate-fade-in"
-              title="Professional PPT Presentation"
-              allow="fullscreen"
-              onLoad={(e) => {
-                const iframe = e.currentTarget;
-                if (iframe && iframe.contentWindow) {
-                  // 延遲 150 毫秒，確保 iframe 內部的 JS 與 DOM 已經完全初始化完畢
+        <div className="w-full h-full flex flex-col bg-zinc-950 text-zinc-100 animate-fade-in relative">
+          <div className="flex items-center justify-between text-[10px] text-zinc-450 px-4 py-2 bg-zinc-900 border-b border-zinc-800 shrink-0 select-none">
+            <span className="font-extrabold text-indigo-400 flex items-center gap-1.5 animate-pulse">
+              <Presentation size={13} /> Luna PPT Hub 聯動教學：{presentation.name || "專業簡報"}
+            </span>
+            <span className="px-2 py-0.5 bg-indigo-950 text-indigo-400 rounded-full font-bold border border-indigo-900/40">簡報放映中</span>
+          </div>
+          <iframe
+            src={presentation.contentData}
+            className="flex-1 w-full bg-zinc-950 border-0 shadow-inner"
+            title="Professional PPT Presentation"
+            allow="fullscreen"
+            onLoad={(e) => {
+              const iframe = e.currentTarget;
+              if (iframe && iframe.contentWindow) {
+                // 延遲 150 毫秒，確保 iframe 內部的 JS 與 DOM 已經完全初始化完畢
+                setTimeout(() => {
+                  if (currentPptDeckRef.current) {
+                    iframe.contentWindow?.postMessage({
+                      action: 'sync_start_presentation',
+                      deck: currentPptDeckRef.current
+                    }, '*');
+                  }
+                  // 隨後發送頁碼跳轉，保證頁面完全對齊
                   setTimeout(() => {
                     iframe.contentWindow?.postMessage({
                       action: 'go_to_slide',
                       index: currentPptSlideIndexRef.current
                     }, '*');
-                  }, 150);
-                }
-              }}
-            />
-          </div>
+                  }, 50);
+                }, 150);
+              }
+            }}
+          />
         </div>
       );
     }
