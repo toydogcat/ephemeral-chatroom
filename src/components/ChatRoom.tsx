@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Send,
   Users,
@@ -14,9 +14,10 @@ import {
   Presentation,
   Trash2,
   Megaphone,
-  Laptop
+  Laptop,
+  Edit2
 } from 'lucide-react';
-import type { Player, ChatMessage } from '../types';
+import type { Player, ChatMessage, DrawingData } from '../types';
 import { RoomQRCode } from './RoomQRCode';
 
 interface ChatRoomProps {
@@ -35,6 +36,8 @@ interface ChatRoomProps {
   presentation?: { contentType: string; contentData: string; name?: string } | null;
   onBroadcastPresentation?: (contentType: string, contentData: string, name?: string) => void;
   onClearPresentation?: () => void;
+  drawingData?: DrawingData | null;
+  onBroadcastDrawing?: (drawingMsg: DrawingData) => void;
 }
 
 export const ChatRoom: React.FC<ChatRoomProps> = ({
