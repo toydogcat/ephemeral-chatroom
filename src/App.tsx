@@ -11,6 +11,10 @@ function App() {
     createRoom,
     joinRoom,
     sendMessage,
+    sendFile,
+    isVoiceActive,
+    remoteStream,
+    toggleVoice,
   } = useWebRTC();
 
   return (
@@ -25,6 +29,10 @@ function App() {
           messages={messages}
           isConnected={isConnected}
           onSendMessage={sendMessage}
+          onSendFile={sendFile}
+          isVoiceActive={isVoiceActive}
+          remoteStream={remoteStream}
+          onToggleVoice={toggleVoice}
         />
       )}
     </div>

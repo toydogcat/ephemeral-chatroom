@@ -11,6 +11,11 @@ export interface ChatMessage {
   senderName: string;
   text: string;
   timestamp: number;
+  type?: 'text' | 'file';
+  fileName?: string;
+  fileSize?: number;
+  fileType?: string;
+  fileData?: string; // Base64 data URL
 }
 
 export interface RoomState {
