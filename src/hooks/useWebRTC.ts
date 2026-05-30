@@ -4,7 +4,11 @@ import type { Player, ChatMessage, RoomState, SignalingMessage, SignalingData } 
 
 const MQTT_BROKER = 'wss://broker.emqx.io:8084/mqtt';
 const ICE_SERVERS = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' }
+  ],
 };
 
 export function useWebRTC() {
@@ -24,7 +28,7 @@ export function useWebRTC() {
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [joinError, setJoinError] = useState<string | null>(null);
 
-  // 課堂大屏幕狀態 (同步展示教材或公告)
+  // 課堂大屏幕狀態
   const [presentation, setPresentation] = useState<{
     contentType: string;
     contentData: string;
@@ -37,7 +41,8 @@ export function useWebRTC() {
   const roomIdRef = useRef<string | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   
-  // playersRef 同步，完美避免閉包 Bug
+  // 解決 WebRTC 跨網絡 (如 Wi-Fi vs 5G 行動網絡) 連線 Timing 問題的暫存隊列
+  const pendingCandidates = useRef<{ [key: string]: RTCIceCandidateInit[] }>({});
   const playersRef = useRef<Player[]>([]);
 
   useEffect(() => {
@@ -95,7 +100,7 @@ export function useWebRTC() {
     dc.onmessage = (event) => {
       const data = JSON.parse(event.data);
       
-      // 1. 處理房主禁言指令
+      // 1. 處理禁言指令
       if (data.type === 'control') {
         if (data.action === 'mute' && data.targetId === myId) {
           disableVoice();
@@ -104,7 +109,7 @@ export function useWebRTC() {
         return;
       }
 
-      // 2. 處理課堂電子白板同步指令
+      // 2. 處理大白板同步指令
       if (data.type === 'presentation') {
         setPresentation({
           contentType: data.contentType,
@@ -119,7 +124,7 @@ export function useWebRTC() {
         return;
       }
 
-      // 3. 聊天訊息接收 (修復 data.type 被 msg.type 的 'text' 或 'file' 覆蓋導致 ignored 的 Bug)
+      // 3. 聊天訊息接收
       if (data.senderId) {
         setMessages((prev) => [...prev, data]);
       }
@@ -133,12 +138,12 @@ export function useWebRTC() {
   const handleGuestJoin = useCallback((roomId: string, guestId: string, guestName: string) => {
     const currentPlayers = playersRef.current;
 
-    // 1. 審查暱稱唯一性 (不同 ID 但同名者拒絕)
+    // 審查暱稱唯一性
     const isNameTaken = currentPlayers.some(
       (p) => p.id !== guestId && p.name.toLowerCase() === guestName.toLowerCase()
     );
     if (isNameTaken) {
-      console.log(`Join rejected: Nickname "${guestName}" is already taken.`);
+      console.log(`Join rejected: Nickname "${guestName}" is taken.`);
       mqttClient.current?.publish(
         `luna/chat/${roomId}/join_reject/${guestId}`,
         JSON.stringify({
@@ -149,7 +154,6 @@ export function useWebRTC() {
       return;
     }
 
-    // 2. 檢查是否為「同 ID 重連」
     const existingPlayer = currentPlayers.find((p) => p.id === guestId);
 
     const pc = new RTCPeerConnection(ICE_SERVERS);
@@ -192,7 +196,6 @@ export function useWebRTC() {
       }));
     });
 
-    // 如果老師當前有大白板內容，在新同學進來時，延遲一下將當前的 presentation 發送給他
     if (presentation) {
       setTimeout(() => {
         if (dc.readyState === 'open') {
@@ -263,7 +266,19 @@ export function useWebRTC() {
     }
 
     if (data.sdp) {
+      // 1. 先設定遠端的 Session Description
       await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      
+      // 2. 釋放所有在此之前因為 remoteDescription 尚未就緒而被暫存的 ICE Candidates
+      const candidates = pendingCandidates.current[fromId] || [];
+      for (const cand of candidates) {
+        await pc.addIceCandidate(new RTCIceCandidate(cand)).catch((err) => {
+          console.warn('Deferred ICE Candidate addition failed:', err);
+        });
+      }
+      pendingCandidates.current[fromId] = [];
+
+      // 3. 若為 offer，則回傳 answer
       if (data.sdp.type === 'offer') {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -278,7 +293,18 @@ export function useWebRTC() {
         }
       }
     } else if (data.candidate) {
-      await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+      // 若遠端 SDP 尚未設定，先將 Candidate 快取進暫存隊列，解決跨網 Timing Bug
+      if (pc && pc.remoteDescription) {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch((err) => {
+          console.warn('ICE Candidate addition failed:', err);
+        });
+      } else {
+        if (!pendingCandidates.current[fromId]) {
+          pendingCandidates.current[fromId] = [];
+        }
+        pendingCandidates.current[fromId].push(data.candidate);
+        console.log(`ICE candidate from ${fromId} deferred due to missing remoteDescription.`);
+      }
     }
   }, [myId, setupDataChannel]);
 
@@ -431,7 +457,6 @@ export function useWebRTC() {
     });
   }, [myId, roomState]);
 
-  // 老師端廣播大螢幕白板內容 (P2P 教學模式)
   const broadcastPresentation = useCallback((contentType: string, contentData: string, name?: string) => {
     const myPlayer = roomState?.players.find((p) => p.id === myId);
     if (!myPlayer?.isHost) return;
@@ -452,7 +477,6 @@ export function useWebRTC() {
     setPresentation({ contentType, contentData, name });
   }, [myId, roomState]);
 
-  // 老師端清空全班大白板
   const clearPresentation = useCallback(() => {
     const myPlayer = roomState?.players.find((p) => p.id === myId);
     if (!myPlayer?.isHost) return;
@@ -484,7 +508,6 @@ export function useWebRTC() {
     toggleVoice,
     muteGuest,
     joinError,
-    // 導出大螢幕與推播狀態與方法
     presentation,
     broadcastPresentation,
     clearPresentation,
