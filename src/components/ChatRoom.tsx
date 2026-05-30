@@ -89,6 +89,15 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
   const isMeHost = players.find((p) => p.id === myId)?.isHost || false;
 
+  // 實時快取 Prop 函數 Ref，徹底防範 React 過期閉包 (Stale Closure) 導致螢幕分享截圖定時器與 P2P 信令通道脫勾
+  const onBroadcastPresentationRef = useRef(onBroadcastPresentation);
+  const onClearPresentationRef = useRef(onClearPresentation);
+
+  useEffect(() => {
+    onBroadcastPresentationRef.current = onBroadcastPresentation;
+    onClearPresentationRef.current = onClearPresentation;
+  });
+
   // 記錄當前 PPT 播放的頁碼與簡報內容物件，保證學生切換分頁或新教材載入時 100% 完美保持同步
   const currentPptSlideIndexRef = useRef<number>(0);
   const currentPptDeckRef = useRef<any>(null);
@@ -211,9 +220,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
         // 將畫面導出為 JPEG Base64 (0.5 壓縮率，保證畫質精緻，且大小僅 10~15KB 傳輸極快)
         const base64Data = tempCanvas.toDataURL('image/jpeg', 0.5);
         
-        if (onBroadcastPresentation) {
-          onBroadcastPresentation('image/jpeg', base64Data, '老師的實時投影畫面');
-        }
+        onBroadcastPresentationRef.current?.('image/jpeg', base64Data, '老師的實時投影畫面');
       }, 1200);
 
     } catch (err) {
@@ -241,9 +248,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     }
 
     // 廣播清空教材
-    if (onClearPresentation) {
-      onClearPresentation();
-    }
+    onClearPresentationRef.current?.();
   };
 
   // 儲存所有的筆跡歷史紀錄，防範任何 resizing、Tab 切換、或重新渲染導致畫布被瀏覽器強制抹除
@@ -552,11 +557,20 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
     }
   }
 
+  // 記錄上一次教材的唯一識別碼，防範定時投影高頻刷新時強行干擾學生正常切換 Tab
+  const prevPresentationIdRef = useRef<string | null>(null);
+
   // 當老師推送新教材（PDF, PPT, 圖片）時，自動幫全體成員（包含老師與學生）將當前頁面切換至大屏幕，保證即時展現！
   useEffect(() => {
     if (presentation) {
-      setActiveTab('board');
-      setHasNewPresentation(false); // 既然自動切換了，就不需要再顯示紅點提示
+      const currentId = presentation.name || presentation.contentData.substring(0, 50);
+      if (prevPresentationIdRef.current !== currentId) {
+        prevPresentationIdRef.current = currentId;
+        setActiveTab('board');
+        setHasNewPresentation(false); // 既然自動切換了，就不需要再顯示紅點提示
+      }
+    } else {
+      prevPresentationIdRef.current = null;
     }
   }, [presentation]);
 
